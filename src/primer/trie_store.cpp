@@ -11,20 +11,59 @@ auto TrieStore::Get(std::string_view key) -> std::optional<ValueGuard<T>> {
   // (2) Lookup the value in the trie.
   // (3) If the value is found, return a ValueGuard object that holds a reference to the value and the
   //     root. Otherwise, return std::nullopt.
-  throw NotImplementedException("TrieStore::Get is not implemented.");
+  // smartptr will release the memory
+  Trie * root;
+  {
+    std::lock_guard<std::mutex> lc(root_lock_);
+    root = &this->root_;
+  }
+  auto res = root->Get<T>(key);
+  if (res == nullptr) {
+    return std::nullopt;
+  }
+  return std::make_optional<ValueGuard<T>>(*root, *res);
+  // throw NotImplementedException("TrieStore::Get is not implemented.");
 }
 
 template <class T>
 void TrieStore::Put(std::string_view key, T value) {
   // You will need to ensure there is only one writer at a time. Think of how you can achieve this.
   // The logic should be somehow similar to `TrieStore::Get`.
-  throw NotImplementedException("TrieStore::Put is not implemented.");
+  Trie * root;
+  {
+    std::lock_guard<std::mutex> wlock(write_lock_);
+    {
+      std::lock_guard<std::mutex> rlock(root_lock_);
+      root = &root_;
+    }
+    auto res = root->Put<T>(key, std::move(value));
+    {
+      std::lock_guard<std::mutex> rlock(root_lock_);
+      root_ = res;
+    }
+  }
+  // throw NotImplementedException("TrieStore::Put is not implemented.");
 }
 
 void TrieStore::Remove(std::string_view key) {
   // You will need to ensure there is only one writer at a time. Think of how you can achieve this.
   // The logic should be somehow similar to `TrieStore::Get`.
-  throw NotImplementedException("TrieStore::Remove is not implemented.");
+  // throw NotImplementedException("TrieStore::Remove is not implemented.");
+  /// Remove has many conditions. In Storage layer we just pass it to Trie layer
+  /// Cause this is a copy on write Trie, write_lock is expected to acquired
+  Trie * root;
+  {
+    std::lock_guard<std::mutex> wlock(write_lock_);
+    {
+      std::lock_guard<std::mutex> rlock(root_lock_);
+      root = &root_;
+    }
+    auto res = root->Remove(key);
+    {
+      std::lock_guard<std::mutex> rlock(root_lock_);
+      root_ = res;
+    }
+  }
 }
 
 // Below are explicit instantiation of template functions.
