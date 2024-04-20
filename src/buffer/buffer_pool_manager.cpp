@@ -22,10 +22,6 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager *disk_manager
                                      LogManager *log_manager)
     : pool_size_(pool_size), disk_manager_(disk_manager), log_manager_(log_manager) {
   // TODO(students): remove this line after you have implemented the buffer pool manager
-  throw NotImplementedException(
-      "BufferPoolManager is not implemented yet. If you have finished implementing BPM, please remove the throw "
-      "exception line in `buffer_pool_manager.cpp`.");
-
   // we allocate a consecutive memory space for the buffer pool
   pages_ = new Page[pool_size_];
   replacer_ = std::make_unique<LRUKReplacer>(pool_size, replacer_k);
@@ -38,21 +34,142 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager *disk_manager
 
 BufferPoolManager::~BufferPoolManager() { delete[] pages_; }
 
-auto BufferPoolManager::NewPage(page_id_t *page_id) -> Page * { return nullptr; }
+auto BufferPoolManager::NewPage(page_id_t *page_id) -> Page * {
+  std::lock_guard<std::mutex> lock(latch_);
+  Page * result = nullptr;
+  frame_id_t frame = -1;
+  if (!free_list_.empty()) {
+    frame = free_list_.front();
+    free_list_.pop_front();
+  } 
+  if (frame == -1) {
+    replacer_->Evict(&frame);
+  }
+  if (frame != -1) {
+    *page_id = AllocatePage();
+    result = &pages_[frame];
+    page_table_.erase(result->GetPageId());
+    {
+      result->WLatch();
+      if (result->IsDirty()) {
+        disk_manager_->WritePage(result->GetPageId(), result->GetData());
+        result->is_dirty_ = false;
+      } 
+      result->page_id_ = *page_id;
+      ++result->pin_count_;
+      result->ResetMemory();
+      result->WUnlatch();
+    }
+    page_table_[*page_id] = frame;
+    replacer_->RecordAccess(frame);
+    replacer_->SetEvictable(frame, false);
+  }
+  return result;
+}
 
 auto BufferPoolManager::FetchPage(page_id_t page_id, [[maybe_unused]] AccessType access_type) -> Page * {
-  return nullptr;
+  std::lock_guard<std::mutex> lock(latch_);
+  auto iter = page_table_.find(page_id);
+  Page * fetch_page = nullptr;
+  if (iter != page_table_.end()) {
+    fetch_page = &pages_[iter->second];
+    fetch_page->WLatch();
+    ++fetch_page->pin_count_;
+    fetch_page->WUnlatch();
+    replacer_->RecordAccess(iter->second);
+    replacer_->SetEvictable(iter->second, false);
+    return fetch_page;
+  }
+  // find a free page first 
+  frame_id_t new_frame = -1;
+  if (!free_list_.empty()) {
+    new_frame = free_list_.front();
+    free_list_.pop_front();
+  }
+  if (new_frame == -1) {
+    replacer_->Evict(&new_frame);
+  }
+  if (new_frame != -1) {
+    fetch_page = &pages_[new_frame];
+    {
+      fetch_page->WLatch();
+      if (fetch_page->IsDirty()) {
+        disk_manager_->WritePage(fetch_page->GetPageId(), fetch_page->GetData());
+        fetch_page->is_dirty_ = false;
+      }
+      fetch_page->page_id_ = page_id;
+      ++fetch_page->pin_count_;
+      disk_manager_->ReadPage(page_id, fetch_page->GetData());
+      fetch_page->WUnlatch();
+    }
+    replacer_->RecordAccess(new_frame);
+    replacer_->SetEvictable(new_frame, false);
+    page_table_[page_id] = new_frame;
+  }
+  return fetch_page;
 }
 
 auto BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty, [[maybe_unused]] AccessType access_type) -> bool {
-  return false;
+  BUSTUB_ASSERT(page_id != INVALID_PAGE_ID, "Try to operate an invalid page");
+  std::lock_guard<std::mutex> lock(latch_);
+  auto iter = page_table_.find(page_id);
+  if (iter == page_table_.end() || pages_[iter->second].GetPinCount() == 0) {
+    return false;
+  }
+  Page * target_page = &pages_[iter->second];
+  target_page->WLatch();
+  target_page->is_dirty_ = is_dirty;
+  --target_page->pin_count_;
+  if (target_page->pin_count_ == 0) {
+    replacer_->SetEvictable(iter->second, true);
+  }
+  target_page->WUnlatch();
+  return true;
 }
 
-auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool { return false; }
+auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
+  BUSTUB_ASSERT(page_id != INVALID_PAGE_ID, "Try to flush an invalid page to disk");
+  std::lock_guard<std::mutex> lock(latch_);
+  auto iter = page_table_.find(page_id);
+  if (iter == page_table_.end()) {
+    return false;
+  }
+  Page * target_page = &pages_[iter->second];
+  target_page->WLatch();
+  disk_manager_->WritePage(page_id, target_page->GetData());
+  target_page->is_dirty_ = false;
+  target_page->WUnlatch();
+  return true;
+}
 
-void BufferPoolManager::FlushAllPages() {}
+void BufferPoolManager::FlushAllPages() {
+  for (auto & iter : page_table_) {  
+    FlushPage(iter.first);
+  }
+}
 
-auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool { return false; }
+auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
+  BUSTUB_ASSERT(page_id != INVALID_PAGE_ID, "Try to delete an invalid page from buffer");
+  std::lock_guard<std::mutex> lock(latch_);
+  auto iter = page_table_.find(page_id);
+  if (iter == page_table_.end()) {
+    return true;
+  }
+  Page * del_page = &pages_[iter->second];
+  // may need page latch here
+  del_page->WLatch();
+  if (del_page->GetPinCount() != 0) {
+    return false;
+  }
+  del_page->is_dirty_ = false;
+  del_page->page_id_ = INVALID_PAGE_ID;
+  del_page->ResetMemory();
+  del_page->WUnlatch();
+  DeallocatePage(page_id);
+  replacer_->Remove(iter->second);
+  free_list_.emplace_back(iter->second);
+  return true;
+}
 
 auto BufferPoolManager::AllocatePage() -> page_id_t { return next_page_id_++; }
 
