@@ -24,8 +24,6 @@ auto BasicPageGuard::operator=(BasicPageGuard &&that) noexcept -> BasicPageGuard
 }
 
 BasicPageGuard::~BasicPageGuard(){
-  bpm_->FlushPage(PageId());
-  bpm_->DeletePage(PageId());
   page_ = nullptr;
 };  // NOLINT
 

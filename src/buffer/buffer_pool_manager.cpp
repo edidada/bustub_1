@@ -73,9 +73,7 @@ auto BufferPoolManager::FetchPage(page_id_t page_id, [[maybe_unused]] AccessType
   Page * fetch_page = nullptr;
   if (iter != page_table_.end()) {
     fetch_page = &pages_[iter->second];
-    fetch_page->WLatch();
     ++fetch_page->pin_count_;
-    fetch_page->WUnlatch();
     replacer_->RecordAccess(iter->second);
     replacer_->SetEvictable(iter->second, false);
     return fetch_page;
@@ -92,7 +90,6 @@ auto BufferPoolManager::FetchPage(page_id_t page_id, [[maybe_unused]] AccessType
   if (new_frame != -1) {
     fetch_page = &pages_[new_frame];
     {
-      fetch_page->WLatch();
       if (fetch_page->IsDirty()) {
         disk_manager_->WritePage(fetch_page->GetPageId(), fetch_page->GetData());
         fetch_page->is_dirty_ = false;
@@ -100,7 +97,6 @@ auto BufferPoolManager::FetchPage(page_id_t page_id, [[maybe_unused]] AccessType
       fetch_page->page_id_ = page_id;
       ++fetch_page->pin_count_;
       disk_manager_->ReadPage(page_id, fetch_page->GetData());
-      fetch_page->WUnlatch();
     }
     replacer_->RecordAccess(new_frame);
     replacer_->SetEvictable(new_frame, false);
@@ -117,13 +113,11 @@ auto BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty, [[maybe_unus
     return false;
   }
   Page * target_page = &pages_[iter->second];
-  target_page->WLatch();
   target_page->is_dirty_ = is_dirty;
   --target_page->pin_count_;
   if (target_page->pin_count_ == 0) {
     replacer_->SetEvictable(iter->second, true);
   }
-  target_page->WUnlatch();
   return true;
 }
 
@@ -135,10 +129,8 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
     return false;
   }
   Page * target_page = &pages_[iter->second];
-  target_page->WLatch();
   disk_manager_->WritePage(page_id, target_page->GetData());
   target_page->is_dirty_ = false;
-  target_page->WUnlatch();
   return true;
 }
 
@@ -157,14 +149,12 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
   }
   Page * del_page = &pages_[iter->second];
   // may need page latch here
-  del_page->WLatch();
   if (del_page->GetPinCount() != 0) {
     return false;
   }
   del_page->is_dirty_ = false;
   del_page->page_id_ = INVALID_PAGE_ID;
   del_page->ResetMemory();
-  del_page->WUnlatch();
   DeallocatePage(page_id);
   replacer_->Remove(iter->second);
   free_list_.emplace_back(iter->second);
@@ -173,12 +163,23 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
 
 auto BufferPoolManager::AllocatePage() -> page_id_t { return next_page_id_++; }
 
-auto BufferPoolManager::FetchPageBasic(page_id_t page_id) -> BasicPageGuard { return {this, nullptr}; }
+auto BufferPoolManager::FetchPageBasic(page_id_t page_id) -> BasicPageGuard { return {this, FetchPage(page_id)}; }
 
-auto BufferPoolManager::FetchPageRead(page_id_t page_id) -> ReadPageGuard { return {this, nullptr}; }
+auto BufferPoolManager::FetchPageRead(page_id_t page_id) -> ReadPageGuard {
+  Page * read_page = FetchPage(page_id);
+  read_page->RLatch();
+  return {this, read_page};
+}
 
-auto BufferPoolManager::FetchPageWrite(page_id_t page_id) -> WritePageGuard { return {this, nullptr}; }
+auto BufferPoolManager::FetchPageWrite(page_id_t page_id) -> WritePageGuard {
+  Page * write_page = FetchPage(page_id);
+  write_page->WLatch();
+  return {this, write_page};
+}
 
-auto BufferPoolManager::NewPageGuarded(page_id_t *page_id) -> BasicPageGuard { return {this, nullptr}; }
+auto BufferPoolManager::NewPageGuarded(page_id_t *page_id) -> BasicPageGuard {
+  NewPage(page_id);
+  return FetchPageBasic(*page_id);
+}
 
 }  // namespace bustub
